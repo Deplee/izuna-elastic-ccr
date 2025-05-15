@@ -3,7 +3,7 @@
 # Параметры подключения
 ES_HOST="localhost:9200"
 ES_USER="admin"
-ES_PASS="admnin"
+ES_PASS="admin"
 
 # Функция для выполнения curl-запросов к ES
 es_request() {
@@ -108,21 +108,15 @@ function manage_policies() {
                             }
                         },
                         "warm": {
-                            "min_age": "7d",
+                            "min_age": "2d",
                             "actions": {
                                 "forcemerge": {
                                     "max_num_segments": 1
-                                },
-                                "allocate": {
-                                    "number_of_replicas": 1,
-                                    "require": {
-                                        "data": "warm"
-                                    }
                                 }
                             }
                         },
                         "cold": {
-                            "min_age": "30d",
+                            "min_age": "4d",
                             "actions": {
                                 "allocate": {
                                     "number_of_replicas": 0,
