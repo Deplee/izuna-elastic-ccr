@@ -3,7 +3,7 @@
 # Параметры подключения
 ES_HOST="localhost:9200"
 ES_USER="admin"
-ES_PASS="admin"
+ES_PASS="admnin"
 
 # Функция для выполнения curl-запросов к ES
 es_request() {
@@ -43,6 +43,9 @@ function manage_index() {
         "read_write")
             es_request "PUT" "$index_name/_settings" '{"index.blocks.write":false}'
             ;;
+        "forcemerge_docs")
+            es_request "POST" "$index_name/_forcemerge?only_expunge_deletes=true" ""
+            ;;
         "forcemerge_segments")
             es_request "POST" "$index_name/_forcemerge?max_num_segments=1" ""
             ;;
@@ -50,10 +53,10 @@ function manage_index() {
             es_request "POST" "$index_name/_refresh" ""
             ;;
         "segments_info")
-            es_request "GET" "$index_name/_segments" ""
+            es_request "GET" "$index_name/_stats/segments" ""
             ;;
-        "deleted_docs")
-            es_request "GET" "$index_name/_stats/docs" ""
+        "deleted_docs_info")
+            es_request "GET" "_cat/indices/$index_name?v&h=index,docs.count,docs.deleted" ""
             ;;
         *)
             echo "Unknown action: $action"
