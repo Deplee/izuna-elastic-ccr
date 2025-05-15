@@ -140,8 +140,7 @@ function manage_policies() {
                 "index_patterns": ["*"],
                 "template": {
                     "settings": {
-                        "index.lifecycle.name": "cleanup_policy",
-                        "index.lifecycle.rollover_alias": "test"
+                        "index.lifecycle.name": "cleanup_policy"
                     }
                 },
                 "priority": 500
