@@ -1,8 +1,5 @@
 #!/bin/bash
 
-# Настройка Elasticsearch для оптимальной производительности репликации
-# Предполагается, что кластер уже установлен и запущен
-
 # Параметры подключения
 ES_HOST="localhost:9200"
 ES_USER="admin"
@@ -14,149 +11,216 @@ es_request() {
     local endpoint=$2
     local data=$3
     
-    curl -X $method "http://$ES_HOST/$endpoint" \
+    response=$(curl -s -w "\n%{http_code}" -X $method "http://$ES_HOST/$endpoint" \
         -H "Content-Type: application/json" \
         -u "$ES_USER:$ES_PASS" \
-        ${data:+-d "$data"}
+        ${data:+-d "$data"})
+    
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | sed \$d)
+    
+    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+        echo "$body"
+    else
+        echo "Error: HTTP $http_code"
+        echo "Response: $body"
+        return 1
+    fi
 }
 
-echo "Настройка кластера Elasticsearch..."
+# Функция для управления индексом
+function manage_index() {
+    local action=$1
+    local index_name=$2
+    
+    case $action in
+        "close")
+            es_request "POST" "$index_name/_close" ""
+            ;;
+        "read_only")
+            es_request "PUT" "$index_name/_settings" '{"index.blocks.write":true}'
+            ;;
+        "read_write")
+            es_request "PUT" "$index_name/_settings" '{"index.blocks.write":false}'
+            ;;
+        "forcemerge_segments")
+            es_request "POST" "$index_name/_forcemerge?max_num_segments=1" ""
+            ;;
+        "refresh")
+            es_request "POST" "$index_name/_refresh" ""
+            ;;
+        "segments_info")
+            es_request "GET" "$index_name/_segments" ""
+            ;;
+        "deleted_docs")
+            es_request "GET" "$index_name/_stats/docs" ""
+            ;;
+        *)
+            echo "Unknown action: $action"
+            exit 1
+            ;;
+    esac
+}
 
-# 1. Настройка памяти и кучи
-echo "Настройка параметров памяти..."
-cat > elasticsearch.yml << EOF
-# Системные настройки
-bootstrap.memory_lock: true
-cluster.name: replication-cluster
-node.name: replication-node
+# Функция для управления кластером
+function manage_cluster() {
+    local action=$1
+    
+    case $action in
+        "health")
+            es_request "GET" "_cluster/health" ""
+            ;;
+        "settings")
+            es_request "GET" "_cluster/settings" ""
+            ;;
+        "state")
+            es_request "GET" "_cluster/state" ""
+            ;;
+        "stats")
+            es_request "GET" "_cluster/stats" ""
+            ;;
+        *)
+            echo "Unknown cluster action: $action"
+            exit 1
+            ;;
+    esac
+}
 
-# Настройки памяти и производительности
-indices.memory.index_buffer_size: 30%
-indices.queries.cache.size: 15%
-indices.fielddata.cache.size: 20%
-indices.recovery.max_bytes_per_sec: 100mb
-indices.recovery.concurrent_streams: 5
+# Функция для управления политиками и шаблонами
+function manage_policies() {
+    local action=$1
+    
+    case $action in
+        "create_cleanup_policy")
+            # Создание политики очистки
+            cleanup_policy='{
+                "policy": {
+                    "phases": {
+                        "hot": {
+                            "min_age": "0ms",
+                            "actions": {
+                                "set_priority": {
+                                    "priority": 100
+                                }
+                            }
+                        },
+                        "warm": {
+                            "min_age": "7d",
+                            "actions": {
+                                "forcemerge": {
+                                    "max_num_segments": 1
+                                },
+                                "allocate": {
+                                    "number_of_replicas": 1,
+                                    "require": {
+                                        "data": "warm"
+                                    }
+                                }
+                            }
+                        },
+                        "cold": {
+                            "min_age": "30d",
+                            "actions": {
+                                "allocate": {
+                                    "number_of_replicas": 0,
+                                    "require": {
+                                        "data": "cold"
+                                    }
+                                },
+                                "set_priority": {
+                                    "priority": 0
+                                }
+                            }
+                        }
+                    }
+                }
+            }'
+            es_request "PUT" "_ilm/policy/cleanup_policy" "$cleanup_policy"
+            ;;
+        "create_template")
+            # Создание шаблона индекса с высоким приоритетом
+            template='{
+                "index_patterns": ["*"],
+                "template": {
+                    "settings": {
+                        "index.lifecycle.name": "cleanup_policy",
+                        "index.lifecycle.rollover_alias": "test"
+                    }
+                },
+                "priority": 500
+            }'
+            es_request "PUT" "_index_template/template_with_cleanup_policy" "$template"
+            ;;
+        "apply_policy_to_all")
+            # Применение политики ко всем существующим индексам
+            all_indices=$(es_request "GET" "_cat/indices?format=json" "" | jq -r '.[].index')
+            for index in $all_indices; do
+                es_request "PUT" "$index/_settings" '{"index.lifecycle.name":"cleanup_policy"}'
+            done
+            ;;
+        "list_policies")
+            es_request "GET" "_ilm/policy" ""
+            ;;
+        "list_templates")
+            es_request "GET" "_index_template" ""
+            ;;
+        *)
+            echo "Unknown policy action: $action"
+            exit 1
+            ;;
+    esac
+}
 
-# Настройки транспорта и HTTP
-transport.tcp.compress: true
-http.compression: true
-http.compression_level: 3
+# Основная функция
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <function> [arguments...]"
+    echo "Available functions:"
+    echo "  manage_index <action> <index_name>"
+    echo "  manage_cluster <action>"
+    echo "  manage_policies <action>"
+    exit 1
+fi
 
-# Настройки безопасности
-xpack.security.enabled: true
-xpack.security.transport.ssl.enabled: true
+function_name=$1
+shift
 
-# Настройки для репликации
-replication.handler.concurrent_reads: 5
-thread_pool.write.size: 30
-thread_pool.write.queue_size: 1000
-EOF
+case $function_name in
+    "manage_index")
+        if [ $# -ne 2 ]; then
+            echo "Usage: $0 manage_index <action> <index_name>"
+            exit 1
+        fi
+        manage_index "$1" "$2"
+        ;;
+    "manage_cluster")
+        if [ $# -ne 1 ]; then
+            echo "Usage: $0 manage_cluster <action>"
+            exit 1
+        fi
+        manage_cluster "$1"
+        ;;
+    "manage_policies")
+        if [ $# -ne 1 ]; then
+            echo "Usage: $0 manage_policies <action>"
+            exit 1
+        fi
+        manage_policies "$1"
+        ;;
+    *)
+        echo "Unknown function: $function_name"
+        exit 1
+        ;;
+esac
 
-# 2. Настройка JVM
-cat > jvm.options << EOF
--Xms4g
--Xmx4g
--XX:+UseG1GC
--XX:G1ReservePercent=25
--XX:InitiatingHeapOccupancyPercent=30
--XX:+HeapDumpOnOutOfMemoryError
-EOF
-
-# 3. Настройка безопасности
-echo "Настройка безопасности..."
-es_request PUT "_security/user/admin" '{
-  "password" : "admin",
-  "roles" : [ "superuser" ],
-  "full_name" : "Administrator"
-}'
-
-# 4. Оптимизация для репликации
-echo "Применение оптимизаций для репликации..."
-es_request PUT "_cluster/settings" '{
-  "persistent": {
-    "indices.recovery.max_bytes_per_sec": "100mb",
-    "indices.recovery.concurrent_streams": 5,
-    "cluster.routing.allocation.node_concurrent_recoveries": 5,
-    "cluster.routing.allocation.cluster_concurrent_rebalance": 5
-  }
-}'
-
-# 5. Настройка индексов по умолчанию
-echo "Настройка шаблонов индексов..."
-es_request PUT "_template/default_template" '{
-  "index_patterns": ["*"],
-  "settings": {
-    "number_of_shards": 5,
-    "number_of_replicas": 1,
-    "refresh_interval": "30s",
-    "index.merge.scheduler.max_thread_count": 4,
-    "index.translog.durability": "async",
-    "index.translog.sync_interval": "30s",
-    "lifecycle.name": "default_policy"
-  }
-}'
-
-# 6. Настройка политики ILM
-echo "Настройка политики жизненного цикла индексов..."
-es_request PUT "_ilm/policy/default_policy" '{
-  "policy": {
-    "phases": {
-      "hot": {
-        "min_age": "0ms",
-        "actions": {
-          "rollover": {
-            "max_age": "30d",
-            "max_size": "50gb",
-            "max_docs": 100000000
-          },
-          "set_priority": {
-            "priority": 100
-          }
-        }
-      },
-      "warm": {
-        "min_age": "30d",
-        "actions": {
-          "shrink": {
-            "number_of_shards": 1
-          },
-          "forcemerge": {
-            "max_num_segments": 1
-          },
-          "set_priority": {
-            "priority": 50
-          },
-          "allocate": {
-            "number_of_replicas": 1
-          }
-        }
-      },
-      "cold": {
-        "min_age": "60d",
-        "actions": {
-          "set_priority": {
-            "priority": 0
-          },
-          "allocate": {
-            "number_of_replicas": 0
-          },
-          "freeze": {}
-        }
-      },
-      "delete": {
-        "min_age": "90d",
-        "actions": {
-          "delete": {
-            "delete_searchable_snapshot": true
-          }
-        }
-      }
-    }
-  }
-}'
-
-# 7. Проверка статуса кластера
-echo "Проверка статуса кластера..."
-es_request GET "_cluster/health"
-
-echo "Настройка завершена. Пожалуйста, перезапустите Elasticsearch для применения изменений."
+# Примеры использования:
+# ./prepare_es_cluster.sh
+# manage_index "read_only" "my-index"      # Перевести в режим только для чтения
+# manage_index "forcemerge_segments" "my-index"  # Выполнить forcemerge
+# manage_index "read_write" "my-index"     # Вернуть в режим чтения-записи
+# manage_cluster "health"                  # Проверить статус кластера
+# manage_cluster "settings"                # Получить настройки кластера
+# manage_policies "create_cleanup_policy"  # Создать политику очистки
+# manage_policies "create_template"        # Создать шаблон индекса
+# manage_policies "apply_policy_to_all"    # Применить политику ко всем индексам
+# manage_policies "list_policies"          # Показать все политики
+# manage_policies "list_templates"         # Показать все шаблоны
